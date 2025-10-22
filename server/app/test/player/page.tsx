@@ -50,7 +50,7 @@ export default function LiveAudioPlayer() {
   }, []);
 
   const connect = async () => {
-    const ws = new WebSocket("ws://localhost:3000/api/playback");
+    const ws = new WebSocket("ws://pi:3000/api/playback");
     wsRef.current = ws;
 
     ws.onopen = () => {
