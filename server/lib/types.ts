@@ -19,6 +19,7 @@ export interface AsrMessage {
     parameters?: {
       format: "pcm";
       sample_rate: number;
+      heartbeat?: boolean;
       // 可选：vocabulary_id?: string; 等
     };
     input?: Record<string, unknown>;

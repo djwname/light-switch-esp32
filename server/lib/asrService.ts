@@ -10,7 +10,6 @@ const CONFIG = {
   apiKey: process.env.DASHSCOPE_API_KEY || "",
   wsUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
   sampleRate: 16000,
-  taskStartTimeout: 5000,
   reconnectDelay: 3000,
 } as const;
 
@@ -21,34 +20,26 @@ interface AsrCallbacks {
   onError?: (error: string) => void;
 }
 
-// ==================== ASR 服务 ====================
+// ==================== ASR 服务（最简化版）====================
 export class AsrService {
-  private static instance: AsrService | null = null;
-
   private ws: WebSocket | null = null;
   private taskId = "";
   private taskStarted = false;
-  private taskStartTimer: NodeJS.Timeout | null = null;
-  private reconnectTimer: NodeJS.Timeout | null = null;
-
+  private destroyed = false; // ✅ 新增：标记是否已销毁
   private readonly callbacks: Required<AsrCallbacks>;
+  private readonly clientId: string;
 
-  private constructor(callbacks: AsrCallbacks) {
+  constructor(callbacks: AsrCallbacks, clientId: string = "default") {
+    this.clientId = clientId;
     this.callbacks = {
       onResult: callbacks.onResult,
       onComplete: callbacks.onComplete || (() => {}),
       onError:
-        callbacks.onError || ((err) => console.error("[ASR Error]", err)),
+        callbacks.onError ||
+        ((err) => console.error(`[ASR ${this.clientId}]`, err)),
     };
-  }
 
-  // ==================== 单例模式 ====================
-  static getInstance(callbacks: AsrCallbacks): AsrService {
-    if (!AsrService.instance) {
-      AsrService.instance = new AsrService(callbacks);
-      AsrService.instance.connect();
-    }
-    return AsrService.instance;
+    this.connect();
   }
 
   // ==================== 连接管理 ====================
@@ -71,15 +62,15 @@ export class AsrService {
     });
 
     this.setupWebSocketHandlers();
-    console.log(`[ASR] 连接中... (task_id: ${this.taskId})`);
+    console.log(`[ASR ${this.clientId}] 连接中... (task_id: ${this.taskId})`);
   }
 
   private setupWebSocketHandlers(): void {
     if (!this.ws) return;
 
     this.ws.on("open", () => {
-      console.log("[ASR] ✅ WebSocket 已连接");
-      this.startTaskWithTimeout();
+      console.log(`[ASR ${this.clientId}] ✅ WebSocket 已连接`);
+      this.sendRunTask();
     });
 
     this.ws.on("message", (data: WebSocket.RawData) => {
@@ -87,38 +78,36 @@ export class AsrService {
         const message: AsrMessage = JSON.parse(data.toString());
         this.handleMessage(message);
       } catch (error) {
-        console.error("[ASR] 解析消息失败:", error);
+        console.error(`[ASR ${this.clientId}] 解析消息失败:`, error);
       }
     });
 
     this.ws.on("close", (code, reason) => {
       console.log(
-        `[ASR] 连接关闭 (code: ${code}, reason: ${reason.toString()})`,
+        `[ASR ${this.clientId}] 连接关闭 (code: ${code}, reason: ${reason.toString()})`,
       );
-      this.cleanup();
-      this.scheduleReconnect();
+      this.taskStarted = false;
+      this.ws = null;
+      if (this.destroyed) {
+        console.log(`[ASR ${this.clientId}] 已销毁，不再重连`);
+        return;
+      }
+      // 3秒后自动重连
+      setTimeout(() => this.connect(), CONFIG.reconnectDelay);
     });
 
     this.ws.on("error", (error) => {
-      console.error("[ASR] WebSocket 错误:", error.message);
+      console.error(`[ASR ${this.clientId}] WebSocket 错误:`, error.message);
       this.callbacks.onError(`WebSocket 错误: ${error.message}`);
     });
   }
 
   // ==================== 任务管理 ====================
-  private startTaskWithTimeout(): void {
-    this.sendRunTask();
-    this.taskStartTimer = setTimeout(() => {
-      if (!this.taskStarted) {
-        console.warn("[ASR] ⚠️ task-started 超时，重试...");
-        this.startTaskWithTimeout();
-      }
-    }, CONFIG.taskStartTimeout);
-  }
-
   private sendRunTask(): void {
     if (!this.isConnected()) {
-      console.error("[ASR] WebSocket 未就绪，无法发送 run-task");
+      console.error(
+        `[ASR ${this.clientId}] WebSocket 未就绪，无法发送 run-task`,
+      );
       return;
     }
 
@@ -143,7 +132,7 @@ export class AsrService {
     };
 
     this.ws!.send(JSON.stringify(message));
-    console.log("[ASR] 已发送 run-task");
+    console.log(`[ASR ${this.clientId}] 已发送 run-task`);
   }
 
   private sendFinishTask(): void {
@@ -159,7 +148,7 @@ export class AsrService {
     };
 
     this.ws!.send(JSON.stringify(message));
-    console.log("[ASR] 已发送 finish-task");
+    console.log(`[ASR ${this.clientId}] 已发送 finish-task`);
   }
 
   // ==================== 消息处理 ====================
@@ -170,52 +159,38 @@ export class AsrService {
 
     switch (event) {
       case "task-started":
-        this.onTaskStarted();
+        console.log(`[ASR ${this.clientId}] ✅ 任务已启动，开始接收音频`);
+        this.taskStarted = true;
         break;
 
       case "result-generated":
-        this.onResultGenerated(message);
+        const sentence = message.payload?.output?.sentence;
+        if (sentence) {
+          this.callbacks.onResult(sentence.text, sentence.sentence_end);
+
+          if (sentence.sentence_end) {
+            console.log(
+              `[ASR ${this.clientId}] 句子结束: "${sentence.text}" (${sentence.begin_time}-${sentence.end_time}ms)`,
+            );
+          }
+        }
         break;
 
       case "task-finished":
-        console.log("[ASR] 任务完成");
+        console.log(`[ASR ${this.clientId}] 任务完成`);
         this.callbacks.onComplete();
         break;
 
       case "task-failed":
-        this.onTaskFailed(message);
+        const error = `${message.header.error_code}: ${message.header.error_message}`;
+        console.error(`[ASR ${this.clientId}] ❌ 任务失败:`, error);
+        this.callbacks.onError(error);
+        this.taskStarted = false;
         break;
 
       default:
-        console.log(`[ASR] 未知事件: ${event}`);
+        console.log(`[ASR ${this.clientId}] 未知事件: ${event}`);
     }
-  }
-
-  private onTaskStarted(): void {
-    console.log("[ASR] ✅ 任务已启动，开始接收音频");
-    this.taskStarted = true;
-    this.clearTaskStartTimer();
-  }
-
-  private onResultGenerated(message: AsrMessage): void {
-    const sentence = message.payload?.output?.sentence;
-    if (!sentence) return;
-
-    this.callbacks.onResult(sentence.text, sentence.sentence_end);
-
-    if (sentence.sentence_end) {
-      console.log(
-        `[ASR] 句子结束: "${sentence.text}" (${sentence.begin_time}-${sentence.end_time}ms)`,
-      );
-    }
-  }
-
-  private onTaskFailed(message: AsrMessage): void {
-    const error = `${message.header.error_code}: ${message.header.error_message}`;
-    console.error("[ASR] ❌ 任务失败:", error);
-    this.callbacks.onError(error);
-    this.taskStarted = false;
-    this.clearTaskStartTimer();
   }
 
   // ==================== 音频流管理 ====================
@@ -227,14 +202,14 @@ export class AsrService {
     try {
       this.ws!.send(chunk);
     } catch (error) {
-      console.error("[ASR] 发送音频块失败:", error);
+      console.error(`[ASR ${this.clientId}] 发送音频块失败:`, error);
       this.callbacks.onError(`发送失败: ${error}`);
     }
   }
 
   endStream(): void {
     if (this.taskStarted) {
-      setTimeout(() => this.sendFinishTask(), 500);
+      this.sendFinishTask();
       this.taskStarted = false;
     }
   }
@@ -244,45 +219,26 @@ export class AsrService {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
-  private clearTaskStartTimer(): void {
-    if (this.taskStartTimer) {
-      clearTimeout(this.taskStartTimer);
-      this.taskStartTimer = null;
-    }
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
-
-    this.reconnectTimer = setTimeout(() => {
-      console.log("[ASR] 尝试重新连接...");
-      this.reconnectTimer = null;
-      this.connect();
-    }, CONFIG.reconnectDelay);
-  }
-
-  private cleanup(): void {
-    this.ws = null;
-    this.taskStarted = false;
-    this.clearTaskStartTimer();
-  }
-
   // ==================== 销毁 ====================
+
   destroy(): void {
-    console.log("[ASR] 销毁实例");
-    this.clearTaskStartTimer();
+    if (this.destroyed) return; // 防止重复调用
+    console.log(`[ASR ${this.clientId}] 销毁实例`);
+    this.destroyed = true; // ✅ 标记为销毁
+    try {
+      if (this.taskStarted) {
+        this.sendFinishTask();
+        this.taskStarted = false;
+      }
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+      if (this.ws) {
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.close(1000, "Client destroyed");
+        }
+        this.ws = null;
+      }
+    } catch (err) {
+      console.error(`[ASR ${this.clientId}] destroy() 出错:`, err);
     }
-
-    if (this.ws) {
-      this.sendFinishTask();
-      this.ws.close();
-      this.ws = null;
-    }
-
-    AsrService.instance = null;
   }
 }

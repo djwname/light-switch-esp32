@@ -81,13 +81,14 @@ app.prepare().then(() => {
     }
   });
 
-  // ✅ 单个 WebSocketServer，不指定 path
   const wss = new WebSocketServer({
-    noServer: true, // 关键：使用 noServer 模式
+    noServer: true,
   });
 
+  // 连接管理
   const audioBuffers = new Map<string, Buffer>();
   const playbackClients = new Set<WsWebSocket>();
+  const asrInstances = new Map<string, AsrService>();
   let clientCounter = 0;
 
   // 广播音频数据到所有播放客户端
@@ -97,12 +98,13 @@ app.prepare().then(() => {
         try {
           client.send(data);
         } catch (error) {
-          console.error("广播失败:", error);
+          console.error("[Broadcast Audio] 失败:", error);
         }
       }
     });
   }
 
+  // 广播 JSON 数据到所有播放客户端
   function broadcastData(data: any) {
     const message = JSON.stringify(data);
     playbackClients.forEach((client) => {
@@ -110,24 +112,22 @@ app.prepare().then(() => {
         try {
           client.send(message);
         } catch (error) {
-          console.error("广播数据失败:", error);
+          console.error("[Broadcast Data] 失败:", error);
         }
       }
     });
   }
 
-  // ✅ 手动处理 WebSocket 升级请求
+  // 手动处理 WebSocket 升级请求
   httpServer.on("upgrade", (request, socket, head) => {
     const pathname = new URL(request.url!, `http://${request.headers.host}`)
       .pathname;
 
     if (pathname === "/api/audio") {
-      // ESP32 音频输入
       wss.handleUpgrade(request, socket, head, (ws) => {
         handleAudioInput(ws);
       });
     } else if (pathname === "/api/playback") {
-      // 浏览器播放客户端
       wss.handleUpgrade(request, socket, head, (ws) => {
         handlePlaybackClient(ws);
       });
@@ -140,21 +140,50 @@ app.prepare().then(() => {
   function handleAudioInput(ws: WsWebSocket) {
     const clientId = `client_${++clientCounter}`;
     console.log(`[Audio Input] ESP32 连接: ${clientId}`);
+
     audioBuffers.set(clientId, Buffer.alloc(0));
 
-    // 初始化 ASR（全局共享）
-    const asrService = AsrService.getInstance({
-      onResult: (text, isEnd) => {
-        broadcastData({ type: "asr_result", text, isEnd });
-        ws.send(text); // 发送给 ESP32
+    let audioChunkCount = 0; // ✅ 统计收到的音频块数量
+
+    // 为当前客户端创建独立的 ASR 实例
+    const asrService = new AsrService(
+      {
+        onResult: (text, isEnd) => {
+          console.log(`[识别 ${clientId}] ${isEnd ? "✅" : "📝"} "${text}"`);
+
+          // 广播到浏览器
+          broadcastData({
+            type: "asr_result",
+            text,
+            isEnd,
+            clientId,
+          });
+
+          // 只发送给对应的 ESP32
+          if (ws.readyState === 1 && isEnd) {
+            try {
+              ws.send(text);
+            } catch (error) {
+              console.error(`[ESP32 ${clientId}] 发送失败:`, error);
+            }
+          }
+        },
+        onComplete: () => {
+          console.log(`[ASR ${clientId}] 流结束`);
+        },
+        onError: (error) => {
+          console.error(`[ASR ${clientId}] 错误:`, error);
+
+          // ✅ 如果是 NO_INPUT_AUDIO_ERROR，检查是否真的没收到音频
+          if (error.includes("NO_INPUT_AUDIO_ERROR")) {
+            console.warn(`[${clientId}] 已收到 ${audioChunkCount} 个音频块`);
+          }
+        },
       },
-      onComplete: () => {
-        console.log("ASR 流结束");
-      },
-      onError: (error) => {
-        console.error("ASR 错误:", error);
-      },
-    });
+      clientId,
+    );
+
+    asrInstances.set(clientId, asrService);
 
     ws.on("message", (data: Buffer) => {
       const currentBuffer = audioBuffers.get(clientId);
@@ -162,19 +191,18 @@ app.prepare().then(() => {
 
       // 广播实时音频到播放客户端
       broadcastAudio(data);
-      asrService?.appendAudioChunk(data);
+
+      // 发送到该客户端专属的 ASR 服务
+      const asr = asrInstances.get(clientId);
+      if (asr) {
+        asr.appendAudioChunk(data);
+      }
 
       const newBuffer = Buffer.concat([currentBuffer, data]);
       audioBuffers.set(clientId, newBuffer);
 
-      // console.log(
-      //   `[${clientId}] Buffer: ${newBuffer.length} / ${BUFFER_SIZE} bytes (${((newBuffer.length / BUFFER_SIZE) * 100).toFixed(1)}%)`,
-      // );
-
       if (newBuffer.length >= BUFFER_SIZE) {
-        // console.log(`[${clientId}] Buffer 已满，保存文件...`);
-        // saveAudioFile(clientId, newBuffer);
-        audioBuffers.set(clientId, Buffer.alloc(0)); // 重置缓冲
+        audioBuffers.set(clientId, Buffer.alloc(0));
       }
     });
 
@@ -182,22 +210,38 @@ app.prepare().then(() => {
       const remainingBuffer = audioBuffers.get(clientId);
       if (remainingBuffer?.length) {
         console.log(`[${clientId}] 连接断开，保存剩余数据...`);
-        saveAudioFile(clientId, remainingBuffer);
+        //saveAudioFile(clientId, remainingBuffer);
       }
+
+      // 清理资源
       audioBuffers.delete(clientId);
-      console.log(`[Audio Input] ESP32 断开: ${clientId}`);
+      const asr = asrInstances.get(clientId);
+      if (asr) {
+        asr.destroy();
+        asrInstances.delete(clientId);
+      }
+
+      console.log(
+        `[Audio Input] ESP32 断开: ${clientId} (剩余: ${asrInstances.size})`,
+      );
     });
 
     ws.on("error", (error) => {
       console.error(`[${clientId}] WebSocket 错误:`, error);
+
+      // 错误时也要清理
+      audioBuffers.delete(clientId);
+      const asr = asrInstances.get(clientId);
+      if (asr) {
+        asr.destroy();
+        asrInstances.delete(clientId);
+      }
     });
   }
 
   // 处理浏览器播放客户端
   function handlePlaybackClient(ws: WsWebSocket) {
-    console.log(
-      `[Playback] 浏览器客户端连接 (总数: ${playbackClients.size + 1})`,
-    );
+    console.log(`[Playback] 浏览器连接 (总数: ${playbackClients.size + 1})`);
     playbackClients.add(ws);
 
     // 发送音频配置
@@ -212,26 +256,28 @@ app.prepare().then(() => {
 
     ws.on("close", () => {
       playbackClients.delete(ws);
-      console.log(`[Playback] 客户端断开 (剩余: ${playbackClients.size})`);
+      console.log(`[Playback] 浏览器断开 (剩余: ${playbackClients.size})`);
     });
 
     ws.on("error", (error) => {
-      console.error("[Playback] 客户端错误:", error);
+      console.error("[Playback] 错误:", error);
       playbackClients.delete(ws);
     });
   }
 
   httpServer.listen(CONFIG.port, (err?: Error) => {
     if (err) throw err;
-    console.log(`> Server ready on http://${CONFIG.hostname}:${CONFIG.port}`);
     console.log(
-      `> Audio Input: ws://${CONFIG.hostname}:${CONFIG.port}/api/audio`,
+      `\n🚀 Server ready on http://${CONFIG.hostname}:${CONFIG.port}`,
     );
     console.log(
-      `> Audio Playback: ws://${CONFIG.hostname}:${CONFIG.port}/api/playback`,
+      `📡 Audio Input: ws://${CONFIG.hostname}:${CONFIG.port}/api/audio`,
     );
     console.log(
-      `> Audio buffer: ${(BUFFER_SIZE / 1024 / 1024).toFixed(2)} MB (${CONFIG.audio.bufferDurationMs / 1000}s)`,
+      `🔊 Audio Playback: ws://${CONFIG.hostname}:${CONFIG.port}/api/playback`,
+    );
+    console.log(
+      `💾 Buffer: ${(BUFFER_SIZE / 1024 / 1024).toFixed(2)} MB (${CONFIG.audio.bufferDurationMs / 1000}s)\n`,
     );
   });
 });
