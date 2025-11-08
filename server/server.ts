@@ -210,7 +210,7 @@ app.prepare().then(() => {
       const remainingBuffer = audioBuffers.get(clientId);
       if (remainingBuffer?.length) {
         console.log(`[${clientId}] 连接断开，保存剩余数据...`);
-        //saveAudioFile(clientId, remainingBuffer);
+        saveAudioFile(clientId, remainingBuffer);
       }
 
       // 清理资源
