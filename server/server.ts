@@ -22,6 +22,7 @@ const CONFIG = {
     channels: 1,
     bitDepth: 16,
     bufferDurationMs: 10000,
+    autoSaveIntervalMs: 60000, // ✅ 每60秒自动保存
   },
 } as const;
 
@@ -31,19 +32,30 @@ const BUFFER_SIZE =
   CONFIG.audio.sampleRate *
   BYTES_PER_SAMPLE;
 
-function saveAudioFile(clientId: string, buffer: Buffer): void {
+function saveAudioFile(
+  clientId: string,
+  buffer: Buffer,
+  segmentIndex?: number,
+): void {
   const { WaveFile } = require("wavefile");
   if (buffer.length % 2 !== 0) {
     console.error(`Invalid buffer length: ${buffer.length}`);
     return;
   }
 
+  // ✅ 如果没有数据就不保存
+  if (buffer.length === 0) {
+    console.log(`[${clientId}] 缓冲区为空，跳过保存`);
+    return;
+  }
+
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const segmentStr = segmentIndex !== undefined ? `_seg${segmentIndex}` : "";
   const filePath = path.join(
     __dirname,
     "public",
     "audio",
-    `audio_${clientId}_${timestamp}.wav`,
+    `audio_${clientId}${segmentStr}_${timestamp}.wav`,
   );
 
   const samples = new Int16Array(
@@ -60,7 +72,7 @@ function saveAudioFile(clientId: string, buffer: Buffer): void {
     samples,
   );
   writeFileSync(filePath, wav.toBuffer());
-  console.log(`Saved: ${filePath} (${(buffer.length / 1024).toFixed(2)} KB)`);
+  console.log(`✅ 保存: ${filePath} (${(buffer.length / 1024).toFixed(2)} KB)`);
 }
 
 const app = next({
@@ -89,6 +101,8 @@ app.prepare().then(() => {
   const audioBuffers = new Map<string, Buffer>();
   const playbackClients = new Set<WsWebSocket>();
   const asrInstances = new Map<string, AsrService>();
+  const saveTimers = new Map<string, NodeJS.Timeout>(); // ✅ 保存定时器
+  const segmentCounters = new Map<string, number>(); // ✅ 文件段计数器
   let clientCounter = 0;
 
   // 广播音频数据到所有播放客户端
@@ -142,8 +156,25 @@ app.prepare().then(() => {
     console.log(`[Audio Input] ESP32 连接: ${clientId}`);
 
     audioBuffers.set(clientId, Buffer.alloc(0));
+    segmentCounters.set(clientId, 0);
 
-    let audioChunkCount = 0; // ✅ 统计收到的音频块数量
+    let audioChunkCount = 0;
+
+    // ✅ 启动定时保存
+    const saveTimer = setInterval(() => {
+      const buffer = audioBuffers.get(clientId);
+      if (buffer && buffer.length > 0) {
+        const segmentIndex = segmentCounters.get(clientId) || 0;
+        console.log(`[${clientId}] ⏰ 定时保存 (段 ${segmentIndex + 1})`);
+        saveAudioFile(clientId, buffer, segmentIndex);
+
+        // 保存后清空缓冲区，开始新的段
+        audioBuffers.set(clientId, Buffer.alloc(0));
+        segmentCounters.set(clientId, segmentIndex + 1);
+      }
+    }, CONFIG.audio.autoSaveIntervalMs);
+
+    saveTimers.set(clientId, saveTimer);
 
     // 为当前客户端创建独立的 ASR 实例
     const asrService = new AsrService(
@@ -174,7 +205,6 @@ app.prepare().then(() => {
         onError: (error) => {
           console.error(`[ASR ${clientId}] 错误:`, error);
 
-          // ✅ 如果是 NO_INPUT_AUDIO_ERROR，检查是否真的没收到音频
           if (error.includes("NO_INPUT_AUDIO_ERROR")) {
             console.warn(`[${clientId}] 已收到 ${audioChunkCount} 个音频块`);
           }
@@ -189,6 +219,8 @@ app.prepare().then(() => {
       const currentBuffer = audioBuffers.get(clientId);
       if (!currentBuffer) return;
 
+      audioChunkCount++;
+
       // 广播实时音频到播放客户端
       broadcastAudio(data);
 
@@ -198,23 +230,32 @@ app.prepare().then(() => {
         asr.appendAudioChunk(data);
       }
 
+      // ✅ 追加到缓冲区（不再检查 BUFFER_SIZE）
       const newBuffer = Buffer.concat([currentBuffer, data]);
       audioBuffers.set(clientId, newBuffer);
-
-      if (newBuffer.length >= BUFFER_SIZE) {
-        audioBuffers.set(clientId, Buffer.alloc(0));
-      }
     });
 
     ws.on("close", () => {
+      // ✅ 清除定时器
+      const timer = saveTimers.get(clientId);
+      if (timer) {
+        clearInterval(timer);
+        saveTimers.delete(clientId);
+      }
+
+      // ✅ 保存最后的数据
       const remainingBuffer = audioBuffers.get(clientId);
       if (remainingBuffer?.length) {
-        console.log(`[${clientId}] 连接断开，保存剩余数据...`);
-        saveAudioFile(clientId, remainingBuffer);
+        const segmentIndex = segmentCounters.get(clientId) || 0;
+        console.log(
+          `[${clientId}] 连接断开，保存最后数据 (段 ${segmentIndex + 1})...`,
+        );
+        saveAudioFile(clientId, remainingBuffer, segmentIndex);
       }
 
       // 清理资源
       audioBuffers.delete(clientId);
+      segmentCounters.delete(clientId);
       const asr = asrInstances.get(clientId);
       if (asr) {
         asr.destroy();
@@ -229,8 +270,16 @@ app.prepare().then(() => {
     ws.on("error", (error) => {
       console.error(`[${clientId}] WebSocket 错误:`, error);
 
+      // ✅ 清除定时器
+      const timer = saveTimers.get(clientId);
+      if (timer) {
+        clearInterval(timer);
+        saveTimers.delete(clientId);
+      }
+
       // 错误时也要清理
       audioBuffers.delete(clientId);
+      segmentCounters.delete(clientId);
       const asr = asrInstances.get(clientId);
       if (asr) {
         asr.destroy();
@@ -277,7 +326,7 @@ app.prepare().then(() => {
       `🔊 Audio Playback: ws://${CONFIG.hostname}:${CONFIG.port}/api/playback`,
     );
     console.log(
-      `💾 Buffer: ${(BUFFER_SIZE / 1024 / 1024).toFixed(2)} MB (${CONFIG.audio.bufferDurationMs / 1000}s)\n`,
+      `⏰ Auto-save: Every ${CONFIG.audio.autoSaveIntervalMs / 1000}s\n`,
     );
   });
 });
